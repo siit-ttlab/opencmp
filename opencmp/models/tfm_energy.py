@@ -61,7 +61,8 @@ TODO: physics to consider adding
     - Temperature-dependent properties (rho, cp, k, nu, sigma), in particular for subcooled conditions.
     - Viscous dissipation and pressure work (negligible for pool boiling).
     - Turbulent / bubble-induced heat diffusivity.
-    - Momentum of the gas created by the gas sources in the dispersed-phase momentum equation.
+    - Momentum of the gas created by the gas sources in the dispersed-phase momentum equation (the coupled heater
+      source has it as [HEATER] vapor_rise_velocity, coupling/tfm_coupled.py; the [INJECTION] source does not).
 """
 
 import logging

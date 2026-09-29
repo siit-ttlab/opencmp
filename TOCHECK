@@ -1,0 +1,56 @@
+Issues found in opencmp/models/tfm.py (TwoFluidModel) while coupling it to the pool boiling automata.
+Line numbers refer to commit f91bf6b. tfm.py has not been modified; the coupled models in the TFM-automata
+repository work around item 1 in their own vapor source term.
+
+
+1. [INJECTION] mixture mass source is scaled by dt (confirmed bug)
+   Line 846:   L += (dt *  mdot * q) * dx_inj          # mixture mass
+   The mixture continuity equation it belongs to is assembled without dt (lines 500-506, "NOT dt-scaled"),
+   while the matching dispersed-phase source (line 845, L += (dt * -mdot * r) * dx_inj) is correctly
+   dt-scaled alongside the dt-scaled alpha_c equation.
+   Effect: the discrete mixture divergence over the injection region equals dt*mdot*V instead of mdot*V
+   (measured 1.74e-6 vs 8.70e-4 m^2/s with dt = 2e-3 s), so the mixture only makes room for a fraction dt of
+   the gas volume that the alpha_c equation adds; liquid is effectively compressed in the injection region.
+   Suggested fix: L += (mdot * q) * dx_inj
+
+
+2. [INJECTION] momentum source (to recheck)
+   Line 851:   L += (dt * mdot * inj_vec * vc) * dx_inj  # continuous-phase momentum
+   - Tested with vc, so the injected gas momentum acts on the liquid rather than the gas (vd).
+   - The momentum equations are written per unit mass (pressure term -p/rho, line ~525), so a mass source
+     Gamma in phase d should contribute (Gamma/(A_d rho_d)) (u_inj - u_d) = (mdot/A_d)(u_inj - u_d); the
+     1/A_d scaling and the -u_d part are missing, making this a constant body acceleration mdot*u_inj.
+   Possible form: implicit  a += dt * mdot/(A_d + eps) * ud * vd  and  L += dt * mdot/(A_d + eps) * inj_vec * vd.
+
+
+3. Discrete liquid volume balance (observation, to check)
+   alpha_c is advected with the gas velocity (line 476, with the lagged div(u_d) term at line 751) and liquid
+   continuity is only implied by the mixture equation (lines 502-506). With a gas source, the liquid volume
+   leaving through the outlet (integral of u_c.n) falls short of the decrease of the liquid volume
+   (integral of alpha_c) by ~0.6% after one step, growing to ~9% after eight steps in the pool boiling
+   example. May be inherent to the discretization rather than a bug; worth checking against a case with a
+   known mass balance.
+
+
+4. Picard convergence test passes on NaN (solve_single_step)
+   Line 927:   if err >= tolerance:
+   - err >= tolerance is False when err (or tolerance) is NaN, so a blown-up iterate is reported as
+     "TFM Picard converged" and accepted. Confirmed in the coupled pool boiling run at t ~ 0.192 s: the step
+     "converged in 17 iterations" with a non-finite solution, and the heater automata then failed on NaN.
+   Possible fix: if not err < tolerance (or check np.isfinite on gfu.vec after the solve and return False).
+   The coupling code works around it in HeaterCouplingMixin.solve_single_step.
+
+
+5. Laminar dispersion force can outgrow the drag (observation, to check)
+   Lines 828-837 (construct_linear, section 5; disp_d at 834, its use at 836):
+       disp_d = 0.75*Cd*Cdis*rho_c/rho_d * H * ngs.Norm(wd - wc)**2
+       L += (dt * disp_d * ngs.grad(Ac) * vd) * ngs.dx
+   - The force is explicit in the Picard wind and grows with |u_d - u_c|^2, like the drag it has to balance;
+     their ratio is ~ Cdis*H*dp*|grad alpha_c|, independent of the slip. Once that exceeds ~1 there is no
+     equilibrium slip, and with the lagged drag coefficient the Picard iterates cycle or blow up regardless
+     of dt. In the coupled pool boiling run (Cdis = 4.545, dp = 3 mm, 0.5 mm wall cells) u_d cycled between
+     30 and 400 m/s at t ~ 0.2 s; with Cdis = 0.05 the same state converged in 3 iterations, but a full
+     run with Cdis = 0.05 still stalled at t ~ 0.2 s in the same cells, so this term accelerates rather
+     than causes that breakdown.
+   - Most dispersion closures (e.g. Favre-averaged drag) are linear in the slip and limited, with the
+     1/(alpha_c alpha_d) weighting; worth checking the intended form and the value of Cdis.

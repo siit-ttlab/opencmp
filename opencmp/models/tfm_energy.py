@@ -61,8 +61,15 @@ TODO: physics to consider adding
     - Temperature-dependent properties (rho, cp, k, nu, sigma), in particular for subcooled conditions.
     - Viscous dissipation and pressure work (negligible for pool boiling).
     - Turbulent / bubble-induced heat diffusivity.
-    - Momentum of the gas created by the gas sources in the dispersed-phase momentum equation (the coupled heater
-      source has it as [HEATER] vapor_rise_velocity, coupling/tfm_coupled.py; the [INJECTION] source does not).
+    - Momentum of the gas created by the gas sources in the dispersed-phase momentum equation. The [INJECTION] source
+      doesn't have it; the time-spreading branch of the TFM-automata coupling adds it to its heater source as
+      [HEATER] vapor_rise_velocity (coupling/tfm_coupled.py there).
+    - Parallel runs with MPI (not physics). OpenCMP has no MPI support: load_mesh gives every rank the whole mesh (no
+      Distribute), and the direct solvers (PARDISO, UMFPACK) are serial. Needed: a distributed mesh, a parallel linear
+      solver (MUMPS, or PETSc through ngsPETSc; the pip NGSolve build has neither), and a check that the DG face terms
+      assemble correctly across subdomains. The TFM-automata coupling manager would then map the automata's
+      per-column data to and from the distributed elements through a column-element table built once at the start,
+      with the automata running serially on one rank.
 """
 
 import logging

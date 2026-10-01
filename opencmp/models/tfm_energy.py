@@ -53,6 +53,21 @@ Parameters are read from the [ENERGY] section of model_dir/model_config:
     epsilon              phase fraction regularization, default 1e-3
     interphase_heat_transfer = RanzMarshall | none, default RanzMarshall
 
+Optional [GAS_FREE] section: regularization of the gas velocity where there is (almost) no gas. Where alpha_d is
+tiny the gas momentum equation barely constrains u_d, and in a gas-free cell u_d has no meaning; letting the
+equations determine it there makes the Picard iteration cycle in flat wall cells and stall the run (see
+docs/stall_low_heat_flux.md of the TFM-automata coupling). With the section, the gas momentum equation (per unit gas
+mass) gets a pull of u_d towards the drift velocity u_c + U_r e_up (e_up against gravity),
+    K_d (u_c + U_r e_up - u_d),   K_d = w(alpha_d) (1 + m) / tau,   m = C_VM rho_c/rho_d (0 without virtual mass),
+    w(alpha_d) = (1 - min(alpha_d/alpha_min, 1))^2   (1 without gas, 0 from alpha_min on),
+so that without gas u_d relaxes to the drift velocity over tau, the gas inertia including its added mass. The
+liquid gets the equal and opposite reaction, K_c = -(alpha_d rho_d)/(alpha_c rho_c) K_d, as for drag and virtual
+mass. alpha_d is taken from the Picard iterate like the other interphase terms. Without the section nothing changes.
+    alpha_min            gas fraction from which the pull is off, default 1e-3
+    relaxation_time      tau [s], default 1e-4
+    drift_velocity       U_r: terminal (the terminal rise velocity of a bubble of diameter dp with the model's drag
+                         closure) or a number [m/s], default terminal
+
 TODO: physics to consider adding
     - Boussinesq buoyancy in the liquid momentum equation, rho_c beta (T_c - T_ref) g, for natural convection.
     - Interphase mass transfer: condensation of vapor in subcooled liquid (and evaporation in superheated liquid),
@@ -65,6 +80,7 @@ TODO: physics to consider adding
 """
 
 import logging
+import math
 from typing import Dict, List, Optional, Union
 
 import ngsolve as ngs
@@ -84,6 +100,7 @@ class TwoFluidModelEnergy(TwoFluidModel):
     """
 
     ENERGY_COMPONENTS = ('t_c', 't_d')
+    GAS_FREE_OPTIONS = {'alpha_min', 'relaxation_time', 'drift_velocity'}
     INTERPHASE_HEAT_TRANSFER_MODELS = ('RanzMarshall', 'none')
     BC_VARIABLES = dict(TwoFluidModel.BC_VARIABLES, neumann=('t_c', 't_d'))
 
@@ -155,6 +172,83 @@ class TwoFluidModelEnergy(TwoFluidModel):
         if self.interphase_heat_transfer not in self.INTERPHASE_HEAT_TRANSFER_MODELS:
             raise ValueError("[ENERGY] interphase_heat_transfer must be one of: {}."
                              .format(', '.join(self.INTERPHASE_HEAT_TRANSFER_MODELS)))
+
+        self.gas_free = model_config.has_section('GAS_FREE')
+        if self.gas_free:
+            unknown = set(model_config['GAS_FREE']) - self.GAS_FREE_OPTIONS
+            if unknown:
+                raise ValueError('Unknown model [GAS_FREE] option(s): {}.'.format(', '.join(sorted(unknown))))
+            self.gas_free_alpha_min = float(model_config.get('GAS_FREE', 'alpha_min', fallback='1e-3'))
+            self.gas_free_relaxation_time = float(model_config.get('GAS_FREE', 'relaxation_time', fallback='1e-4'))
+            drift = model_config.get('GAS_FREE', 'drift_velocity', fallback='terminal').strip().lower()
+            self._gas_free_drift_setting = 'terminal' if drift == 'terminal' else float(drift)
+            if not (0.0 < self.gas_free_alpha_min < 1.0 and self.gas_free_relaxation_time > 0.0):
+                raise ValueError('[GAS_FREE] needs 0 < alpha_min < 1 and relaxation_time > 0.')
+            # Called again every time step (update_model_variables): keep the Parameter the forms refer to.
+            if not hasattr(self, '_gas_free_drift'):
+                self._gas_free_drift = ngs.Parameter(0.0)
+                self.gas_free_drift_velocity = None      # U_r [m/s], set when the forms are built
+
+    # ------------------------------------------------------------------
+    # Gas velocity where there is (almost) no gas ([GAS_FREE])
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def gas_free_weight(alpha_d, alpha_min: float):
+        """ w(alpha_d) = (1 - min(alpha_d/alpha_min, 1))^2, clipped to 1 for alpha_d <= 0. """
+        s = Min(Max(alpha_d / alpha_min, 0.0), 1.0)
+        return (1.0 - s) * (1.0 - s)
+
+    def _gas_free_coefficients(self, time_step: int):
+        """ (K_d, K_c): the rate of the pull on u_d (per unit gas mass) and the liquid's reaction. """
+        ts = time_step
+        Ac = self.UIter.components[self.model_components['alpha_c']]
+        Ad = 1 - Ac
+        m = self.C_VM[ts] * self.rho_c[ts] / self.rho_d[ts] if self.VM_switch else 0.0
+        K_d = self.gas_free_weight(Ad, self.gas_free_alpha_min) * (1.0 + m) / self.gas_free_relaxation_time
+        # K_d vanishes where alpha_c <= 1 - alpha_min, so bounding alpha_c there only avoids 0/0 in pure gas.
+        K_c = -Ad * self.rho_d[ts] / (Max(Ac, 1.0 - self.gas_free_alpha_min) * self.rho_c[ts]) * K_d
+        return K_d, K_c
+
+    def terminal_rise_velocity(self) -> float:
+        """
+        Terminal rise velocity of a single bubble relative to the liquid with the model's own drag closure: the slip
+        U_r at which the drag on the gas (per unit gas mass) balances buoyancy,
+            0.75 C_D(Re) rho_c / (rho_d dp) U_r^2 = (rho_c - rho_d) / rho_d |g|,   Re = U_r dp / nu_c,
+        i.e. U_r = sqrt(4 |g| dp (rho_c - rho_d) / (3 C_D rho_c)), solved by damped fixed-point iteration.
+        """
+        if not self.drag_switch:
+            raise ValueError('[GAS_FREE] drift_velocity = terminal needs a drag model ([TFM] IME drag).')
+        dim = self.mesh.dim
+        el = next(iter(self.mesh.Elements(ngs.VOL)))
+        centre = [sum(self.mesh[v].point[i] for v in el.vertices) / len(el.vertices) for i in range(dim)]
+        mip = self.mesh(*centre)
+
+        def value(cf):
+            return float(ngs.CoefficientFunction(cf)(mip))
+
+        rho_c, rho_d, dp = value(self.rho_c[0]), value(self.rho_d[0]), value(self.dp[0])
+        g = value(ngs.Norm(self.gravity))
+        zero = ngs.CoefficientFunction(tuple([0.0] * dim))
+        u = 0.1
+        for _ in range(500):
+            wd = ngs.CoefficientFunction(tuple([u] + [0.0] * (dim - 1)))
+            Cd = value(self._get_drag_coeff(wd, zero, ngs.CoefficientFunction(0.0), 0))
+            u_new = math.sqrt(4.0 * g * dp * (rho_c - rho_d) / (3.0 * Cd * rho_c))
+            if abs(u_new - u) <= 1e-12 * u_new:
+                return u_new
+            u = 0.5 * (u + u_new)
+        raise RuntimeError('The terminal rise velocity iteration did not converge.')
+
+    def _gas_free_drift_vector(self):
+        """ U_r e_up, with U_r evaluated once when the forms are first built (the drag closure is set by then). """
+        if self.gas_free_drift_velocity is None:
+            setting = self._gas_free_drift_setting
+            self.gas_free_drift_velocity = self.terminal_rise_velocity() if setting == 'terminal' else setting
+            self._gas_free_drift.Set(self.gas_free_drift_velocity)
+            logging.info('[GAS_FREE] u_d is pulled towards u_c + %.4g m/s up where alpha_d < %g (relaxation time %g s).',
+                         self.gas_free_drift_velocity, self.gas_free_alpha_min, self.gas_free_relaxation_time)
+        return self._gas_free_drift * (-self.gravity / ngs.Norm(self.gravity))
 
     def _gas_sources(self) -> List:
         """ (volumetric gas source rate [1/s], dx restricted to its region) for every gas source. """
@@ -265,6 +359,14 @@ class TwoFluidModelEnergy(TwoFluidModel):
             a += (dt * H / rho_cp_c * (Tc - Td) * sc) * ngs.dx
             a += (dt * H / rho_cp_d * (Td - Tc) * sd) * ngs.dx
 
+        # [GAS_FREE] pull of u_d towards u_c + U_r e_up: the u_d - u_c part (U_r part in construct_linear).
+        if self.gas_free:
+            uc, ud = U[comp['u_c']], U[comp['u_d']]
+            vc, vd = V[comp['u_c']], V[comp['u_d']]
+            K_d, K_c = self._gas_free_coefficients(time_step)
+            a += (dt * K_d * (ud - uc) * vd) * ngs.dx
+            a += (dt * K_c * (ud - uc) * vc) * ngs.dx
+
         return [a]
 
     def construct_linear(self,
@@ -293,5 +395,13 @@ class TwoFluidModelEnergy(TwoFluidModel):
         sd = V[comp['t_d']]
         for mdot, dx_src in self._gas_sources():
             L += (dt * mdot * self.T_sat * sd) * dx_src
+
+        # [GAS_FREE] pull of u_d towards u_c + U_r e_up: the U_r part (u_d - u_c part in the bilinear form).
+        if self.gas_free:
+            vc, vd = V[comp['u_c']], V[comp['u_d']]
+            K_d, K_c = self._gas_free_coefficients(time_step)
+            drift = self._gas_free_drift_vector()
+            L += (dt * K_d * drift * vd) * ngs.dx
+            L += (dt * K_c * drift * vc) * ngs.dx
 
         return [L]

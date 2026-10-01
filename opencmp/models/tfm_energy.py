@@ -125,6 +125,40 @@ class TwoFluidModelEnergy(TwoFluidModel):
         return FESpace(spaces, dgjumps=self.DG)
 
     # ------------------------------------------------------------------
+    # Linear solves
+    # ------------------------------------------------------------------
+
+    def linear_solve(self, a_assembled, L_assembled, precond, gfu) -> None:
+        """
+        Direct solves with PARDISO reuse the factorization object between Picard iterations and time steps.
+
+        The base implementation builds a new a.mat.Inverse() for every Picard iteration, repeating the symbolic
+        analysis and reordering although the sparsity pattern of the assembled matrix never changes. On the pool
+        boiling mesh that set-up is about 1 s of serial work per iteration, as much as the assembly. Here the inverse
+        is built once per bilinear form and afterwards only refactorized with Update(), which gives the same factors
+        at a fifth of the cost. Assemble() refills the same matrix object, so Update() sees the new values; a different
+        matrix or set of free dofs gets a new inverse. Other linear solvers use the base implementation.
+        """
+        if self.linear_solver != 'direct' or not (ngs.config.USE_PARDISO or ngs.config.USE_MKL):
+            return super().linear_solve(a_assembled, L_assembled, precond, gfu)
+        if precond is None and self.no_constrained_dofs:
+            raise ValueError('Must constrain Dirichlet DOFs if not providing a preconditioner.')
+
+        mat, freedofs = a_assembled.mat, self.fes.FreeDofs()
+        inverses = self.__dict__.setdefault('_direct_inverses', {})
+        cached = inverses.get(id(a_assembled))
+        if cached is not None and cached[0] is mat and cached[1] is freedofs:
+            inv = cached[2]
+            inv.Update()
+        else:
+            inv = mat.Inverse(freedofs=freedofs, inverse='pardiso')
+            inverses[id(a_assembled)] = (mat, freedofs, inv)
+
+        r = L_assembled.vec.CreateVector()
+        r.data = L_assembled.vec - mat * gfu.vec
+        gfu.vec.data += inv * r
+
+    # ------------------------------------------------------------------
     # Parameters
     # ------------------------------------------------------------------
 

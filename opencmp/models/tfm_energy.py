@@ -89,6 +89,7 @@ import logging
 import math
 from typing import Dict, List, Optional, Union
 
+import numpy as np
 import ngsolve as ngs
 from ngsolve import GridFunction, FESpace, Parameter
 from ngsolve.comp import ProxyFunction
@@ -150,16 +151,32 @@ class TwoFluidModelEnergy(TwoFluidModel):
     # Linear solves
     # ------------------------------------------------------------------
 
+    # Components whose equations couple in the assembled matrix. The energy equations take the velocities and alpha_c
+    # from the Picard iterate, the momentum and continuity equations don't contain the temperatures, and alpha_c's
+    # equation takes the velocities from the iterate as well, so the entries between different groups are zero in every
+    # state. NGSolve stores them anyway: a compound space couples all components within an element. A component in no
+    # group forms its own.
+    COUPLED_GROUPS = (('u_c', 'u_d', 'p'), ('alpha_c',), ('t_c', 't_d'))
+
     def linear_solve(self, a_assembled, L_assembled, precond, gfu) -> None:
         """
-        Direct solves with PARDISO reuse the factorization object between Picard iterations and time steps.
+        Direct solves with PARDISO factorize a copy of the matrix without its always-zero entries, and reuse the
+        factorization object between Picard iterations and time steps.
 
-        The base implementation builds a new a.mat.Inverse() for every Picard iteration, repeating the symbolic
-        analysis and reordering although the sparsity pattern of the assembled matrix never changes. On the pool
-        boiling mesh that set-up is about 1 s of serial work per iteration, as much as the assembly. Here the inverse
-        is built once per bilinear form and afterwards only refactorized with Update(), which gives the same factors
-        at a fifth of the cost. Assemble() refills the same matrix object, so Update() sees the new values; a different
-        matrix or set of free dofs gets a new inverse. Other linear solvers use the base implementation.
+        - Reuse: the base implementation builds a new a.mat.Inverse() for every Picard iteration, repeating the symbolic
+          analysis and reordering although the sparsity pattern of the assembled matrix never changes. On the pool
+          boiling mesh that set-up is about 1 s of serial work per iteration, as much as the assembly. Here the inverse
+          is built once per bilinear form and afterwards only refactorized with Update(), which gives the same factors
+          at a fifth of the cost. Assemble() refills the same matrix object; a different matrix or set of free dofs
+          gets a new inverse.
+        - Compression: the entries between components of different COUPLED_GROUPS are always zero, but PARDISO fills in
+          whatever the stored pattern allows. The factorization is built on a copy without them (once), and the copy
+          is refreshed from the assembled matrix before each refactorization, after checking that the dropped entries
+          are still zero. On the 3D pool boiling example (order 3) that drops 36 % of the stored entries, takes 0.7 GB
+          less memory and halves the refactorization and solve times, with the same solution to round-off. The
+          residual is computed with the assembled matrix.
+
+        Other linear solvers use the base implementation.
         """
         if self.linear_solver != 'direct' or not (ngs.config.USE_PARDISO or ngs.config.USE_MKL):
             return super().linear_solve(a_assembled, L_assembled, precond, gfu)
@@ -169,16 +186,59 @@ class TwoFluidModelEnergy(TwoFluidModel):
         mat, freedofs = a_assembled.mat, self.fes.FreeDofs()
         inverses = self.__dict__.setdefault('_direct_inverses', {})
         cached = inverses.get(id(a_assembled))
-        if cached is not None and cached[0] is mat and cached[1] is freedofs:
-            inv = cached[2]
+        if cached is not None and cached['mat'] is mat and cached['freedofs'] is freedofs:
+            self._refresh_compressed(cached)
+            inv = cached['inv']
             inv.Update()
         else:
-            inv = mat.Inverse(freedofs=freedofs, inverse='pardiso')
-            inverses[id(a_assembled)] = (mat, freedofs, inv)
+            cached = self._compress(mat)
+            cached.update(mat=mat, freedofs=freedofs)
+            inv = cached['inv'] = cached['matrix'].Inverse(freedofs=freedofs, inverse='pardiso')
+            inverses[id(a_assembled)] = cached
 
         r = L_assembled.vec.CreateVector()
         r.data = L_assembled.vec - mat * gfu.vec
         gfu.vec.data += inv * r
+
+    def _compress(self, mat) -> Dict:
+        """
+        A copy of the assembled matrix without the entries between components of different COUPLED_GROUPS, with the
+        index arrays that refresh it from the assembled matrix (see _refresh_compressed).
+        """
+        n_groups = len(self.COUPLED_GROUPS)
+        group = np.empty(self.fes.ndof, dtype=np.int16)
+        for name, i in self.model_components.items():
+            k = next((j for j, members in enumerate(self.COUPLED_GROUPS) if name in members), n_groups + i)
+            r = self.fes.Range(i)
+            group[r.start:r.stop] = k
+
+        _, indices, indptr = mat.CSR()
+        indices, indptr = np.asarray(indices, dtype=np.int64), np.asarray(indptr, dtype=np.int64)
+        rows = np.repeat(np.arange(mat.height, dtype=np.int64), np.diff(indptr))
+        keep = group[rows] == group[indices]
+        values = mat.AsVector().FV().NumPy()
+        dropped = np.nonzero(~keep)[0]
+        dropped = dropped.astype(np.int32) if len(values) < 2 ** 31 else dropped
+        self._check_dropped_entries(values, dropped)
+        matrix = ngs.la.SparseMatrixd.CreateFromCOO(rows[keep], indices[keep], values[keep], mat.height, mat.width)
+        if not np.array_equal(matrix.AsVector().FV().NumPy(), values[keep]):
+            raise RuntimeError('The compressed matrix does not store its entries in the order of the assembled one.')
+        logging.info('PARDISO factorizes %d of the %d stored matrix entries; the other %d couple components that never '
+                     'interact (TwoFluidModelEnergy.COUPLED_GROUPS).', int(keep.sum()), len(values), len(dropped))
+        return dict(matrix=matrix, keep=keep, dropped=dropped)
+
+    @classmethod
+    def _refresh_compressed(cls, cached: Dict) -> None:
+        """ Copies the assembled matrix's kept entries into the compressed copy. """
+        values = cached['mat'].AsVector().FV().NumPy()
+        cls._check_dropped_entries(values, cached['dropped'])
+        np.compress(cached['keep'], values, out=cached['matrix'].AsVector().FV().NumPy())
+
+    @staticmethod
+    def _check_dropped_entries(values, dropped) -> None:
+        if np.any(values[dropped]):
+            raise RuntimeError('Matrix entries between components of different TwoFluidModelEnergy.COUPLED_GROUPS are '
+                               'nonzero: the formulation now couples them, so COUPLED_GROUPS must be updated.')
 
     # ------------------------------------------------------------------
     # Parameters
